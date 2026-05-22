@@ -1,33 +1,56 @@
 import os
+import json
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
+from providers import PROVIDERS
 
 load_dotenv()
 
 app = FastAPI(title="ProspectKit")
 templates = Jinja2Templates(directory="templates")
 
-APOLLO_BASE = "https://api.apollo.io/v1"
+
+def get_provider_keys(request: Request) -> dict:
+    """
+    Read provider API keys from the X-Provider-Keys header (JSON)
+    or fall back to individual env vars per provider.
+    """
+    header = request.headers.get("X-Provider-Keys", "")
+    try:
+        keys = json.loads(header) if header else {}
+    except Exception:
+        keys = {}
+
+    # Merge with env vars (env vars act as fallback / team-wide defaults)
+    env_defaults = {
+        "apollo": os.getenv("APOLLO_API_KEY", ""),
+        "hunter": os.getenv("HUNTER_API_KEY", ""),
+        "prospeo": os.getenv("PROSPEO_API_KEY", ""),
+    }
+    for p, k in env_defaults.items():
+        if k and not keys.get(p):
+            keys[p] = k
+
+    return keys
 
 
-def get_api_key(request: Request) -> str:
+def get_ordered_providers(request: Request, keys: dict) -> list:
     """
-    API key resolution order:
-    1. X-Apollo-Key header (sent by the browser UI — user entered it in settings)
-    2. APOLLO_API_KEY env var (set by team admin for shared deployments)
+    Respect the X-Provider-Order header (comma-separated provider names).
+    Falls back to the order they were configured.
     """
-    key = request.headers.get("X-Apollo-Key") or os.getenv("APOLLO_API_KEY", "")
-    if not key:
-        raise HTTPException(
-            status_code=401,
-            detail="No Apollo API key found. Enter your key in Settings (top right)."
-        )
-    return key
+    order_header = request.headers.get("X-Provider-Order", "")
+    if order_header:
+        order = [p.strip() for p in order_header.split(",") if p.strip()]
+    else:
+        order = list(keys.keys())
+
+    return [p for p in order if p in PROVIDERS and keys.get(p)]
 
 
 class EnrichRequest(BaseModel):
@@ -35,103 +58,97 @@ class EnrichRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     organization_name: Optional[str] = None
+    domain: Optional[str] = None
     email: Optional[str] = None
+
+
+def server_has_keys() -> dict:
+    return {
+        "apollo": bool(os.getenv("APOLLO_API_KEY")),
+        "hunter": bool(os.getenv("HUNTER_API_KEY")),
+        "prospeo": bool(os.getenv("PROSPEO_API_KEY")),
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    # Tell the frontend whether a server-side key is configured
-    has_server_key = bool(os.getenv("APOLLO_API_KEY", ""))
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "has_server_key": has_server_key,
+        "server_keys": server_has_keys(),
+    })
+
+
+@app.get("/providers")
+async def list_providers():
+    """Return metadata about each available provider."""
+    return JSONResponse({
+        name: {
+            "label": cls.label,
+            "supports_linkedin": cls.supports_linkedin,
+            "supports_name": cls.supports_name,
+            "requires_domain": cls.requires_domain,
+        }
+        for name, cls in PROVIDERS.items()
     })
 
 
 @app.post("/enrich")
 async def enrich_contact(payload: EnrichRequest, request: Request):
-    api_key = get_api_key(request)
+    keys = get_provider_keys(request)
+    ordered = get_ordered_providers(request, keys)
+
+    if not ordered:
+        raise HTTPException(status_code=401,
+            detail="No API keys configured. Add at least one provider key in Settings.")
 
     if not payload.linkedin_url and not (payload.first_name and payload.last_name):
-        raise HTTPException(
-            status_code=400,
-            detail="Provide a LinkedIn URL or at least first name + last name.",
-        )
+        raise HTTPException(status_code=400,
+            detail="Provide a LinkedIn URL or at least first name + last name.")
 
-    body = {"reveal_personal_emails": True}
-    if payload.linkedin_url:
-        body["linkedin_url"] = payload.linkedin_url.strip()
-    if payload.first_name:
-        body["first_name"] = payload.first_name.strip()
-    if payload.last_name:
-        body["last_name"] = payload.last_name.strip()
-    if payload.organization_name:
-        body["organization_name"] = payload.organization_name.strip()
-    if payload.email:
-        body["email"] = payload.email.strip()
+    errors = []
+    for provider_name in ordered:
+        provider = PROVIDERS[provider_name](keys[provider_name])
 
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(f"{APOLLO_BASE}/people/match", json=body, headers=headers)
+        # Skip providers that can't handle this input type
+        if payload.linkedin_url and not provider.supports_linkedin:
+            continue
+        if not payload.linkedin_url and not provider.supports_name:
+            continue
 
-    if resp.status_code == 401:
-        raise HTTPException(status_code=401, detail="Invalid Apollo API key. Check your key in Settings.")
-    if resp.status_code == 429:
-        raise HTTPException(status_code=429, detail="Apollo rate limit hit. Try again shortly.")
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Apollo error: {resp.text}")
+        try:
+            result = await provider.enrich(
+                linkedin_url=payload.linkedin_url,
+                first_name=payload.first_name,
+                last_name=payload.last_name,
+                organization_name=payload.organization_name,
+                domain=payload.domain,
+                email=payload.email,
+            )
+            if result.get("found"):
+                return JSONResponse(result)
+            # Not found — try next provider
+            errors.append(f"{provider.label}: not found")
+        except ValueError as e:
+            errors.append(f"{provider.label}: {e}")
+        except Exception as e:
+            errors.append(f"{provider.label}: unexpected error — {e}")
 
-    data = resp.json()
-    person = data.get("person")
-
-    if not person:
-        return JSONResponse({"found": False, "message": "No contact found. Try adding a company name."})
-
-    phones = person.get("phone_numbers") or []
-    mobile = next((p for p in phones if p.get("type") == "mobile"), None)
-    any_phone = mobile or (phones[0] if phones else None)
-
-    email_status = (person.get("email_status") or "unknown").lower()
-    if email_status == "verified":
-        email_confidence, email_label = "high", "Verified"
-    elif email_status in ("likely to engage", "guessed"):
-        email_confidence, email_label = "medium", "Likely Valid"
-    elif email_status == "unavailable":
-        email_confidence, email_label = "none", "Not Found"
-    else:
-        email_confidence, email_label = "medium", email_status.title()
-
-    emails = []
-    if person.get("email"):
-        emails.append({"address": person["email"], "type": "work", "status": email_status})
-    for e in person.get("personal_emails") or []:
-        emails.append({"address": e, "type": "personal", "status": "unknown"})
-
-    location = person.get("city", "")
-    if person.get("state"):
-        location += f", {person['state']}"
-    if person.get("country"):
-        location += f", {person['country']}"
-
+    # All providers exhausted
     return JSONResponse({
-        "found": True,
-        "name": person.get("name", ""),
-        "title": person.get("title", ""),
-        "company": (person.get("organization") or {}).get("name", ""),
-        "linkedin_url": person.get("linkedin_url", ""),
-        "location": location.strip(", "),
-        "emails": emails,
-        "email_confidence": email_confidence,
-        "email_label": email_label,
-        "phone": any_phone.get("sanitized_number") if any_phone else None,
-        "phone_type": any_phone.get("type", "").replace("_", " ").title() if any_phone else None,
-        "photo_url": person.get("photo_url", ""),
+        "found": False,
+        "message": "No contact found across all configured providers.",
+        "tried": errors,
     })
 
 
 @app.post("/bulk-enrich")
 async def bulk_enrich(request: Request):
-    api_key = get_api_key(request)
+    keys = get_provider_keys(request)
+    ordered = get_ordered_providers(request, keys)
+
+    if not ordered:
+        raise HTTPException(status_code=401, detail="No API keys configured.")
+
     body = await request.json()
     urls = [u.strip() for u in (body.get("urls") or "").splitlines() if u.strip()]
 
@@ -140,33 +157,30 @@ async def bulk_enrich(request: Request):
     if len(urls) > 20:
         raise HTTPException(status_code=400, detail="Max 20 URLs per bulk run.")
 
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
     results = []
-    async with httpx.AsyncClient(timeout=20) as client:
-        for url in urls:
+    for url in urls:
+        row = {"url": url, "name": "", "title": "", "company": "",
+               "email": "", "email_status": "not found", "phone": "", "source": ""}
+        for provider_name in ordered:
+            provider = PROVIDERS[provider_name](keys[provider_name])
+            if not provider.supports_linkedin:
+                continue
             try:
-                resp = await client.post(
-                    f"{APOLLO_BASE}/people/match",
-                    json={"linkedin_url": url, "reveal_personal_emails": True},
-                    headers=headers,
-                )
-                person = resp.json().get("person") if resp.status_code == 200 else None
-                if person:
-                    phones = person.get("phone_numbers") or []
-                    mobile = next((p for p in phones if p.get("type") == "mobile"), phones[0] if phones else None)
-                    results.append({
-                        "url": url,
-                        "name": person.get("name", ""),
-                        "title": person.get("title", ""),
-                        "company": (person.get("organization") or {}).get("name", ""),
-                        "email": person.get("email", ""),
-                        "email_status": person.get("email_status", ""),
-                        "phone": mobile.get("sanitized_number", "") if mobile else "",
+                r = await provider.enrich(linkedin_url=url)
+                if r.get("found"):
+                    emails = r.get("emails") or []
+                    row.update({
+                        "name": r.get("name", ""),
+                        "title": r.get("title", ""),
+                        "company": r.get("company", ""),
+                        "email": emails[0]["address"] if emails else "",
+                        "email_status": r.get("email_label", ""),
+                        "phone": r.get("phone") or "",
+                        "source": r.get("source", ""),
                     })
-                else:
-                    results.append({"url": url, "name": "", "title": "", "company": "",
-                                    "email": "", "email_status": "not found", "phone": ""})
-            except Exception as e:
-                results.append({"url": url, "error": str(e)})
+                    break
+            except Exception:
+                pass
+        results.append(row)
 
     return JSONResponse({"results": results})
